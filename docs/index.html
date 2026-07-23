@@ -24,6 +24,14 @@
           股票代號
           <select id="symbolSelect"></select>
         </label>
+        <label>
+          週期
+          <select id="timeframeSelect">
+            <option value="daily">日線</option>
+            <option value="weekly">週線</option>
+            <option value="monthly">月線</option>
+          </select>
+        </label>
         <form id="addSymbolForm">
           <label>
             新增觀察（可輸入任意美股代號）
@@ -77,8 +85,27 @@
         </div>
         <p id="suggestionTitle" class="suggestion-title">--</p>
         <p id="suggestionBody" class="hint">--</p>
+
+        <div class="context-grid">
+          <div class="context-item">
+            <span>大盤環境（S&amp;P 500）</span>
+            <strong id="marketTrend">載入中…</strong>
+          </div>
+          <div class="context-item">
+            <span>52 週價格位階</span>
+            <strong id="valuationContext">--</strong>
+          </div>
+          <div class="context-item">
+            <span>近期波動 / 區間</span>
+            <strong id="riskContext">--</strong>
+          </div>
+        </div>
+
         <p class="hint disclaimer">
-          此建議由技術指標規則自動產生，非投資建議，不構成任何買賣邀約，也未考慮基本面、大盤環境或個人風險承受度。股市有風險，請自行判斷並對投資結果負責。
+          此建議由技術指標規則（KD 交叉）加上大盤趨勢自動產生，非投資建議，不構成任何買賣邀約。52
+          週價格位階只是價格位置，不是本益比、EPS 等真正基本面數字——Yahoo
+          的基本面資料需要登入驗證，純前端網頁無法穩定取得，如需完整基本面資料須另外申請有 API key
+          的資料源或自架後端。波動與區間資訊也不等於部位建議：實際部位大小與停損應由你依自己的資金與風險承受度決定，本工具並不知道你的部位與風險承受度。股市有風險，請自行判斷並對投資結果負責。
         </p>
       </section>
 
@@ -87,7 +114,7 @@
           <div class="panel-head">
             <div>
               <h2 id="chartTitle">走勢</h2>
-              <p>近 30 筆日線資料</p>
+              <p id="chartSubtitle">近 30 筆日線資料</p>
             </div>
             <div id="signalBadge" class="badge">--</div>
           </div>

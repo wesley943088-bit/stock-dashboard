@@ -1,29 +1,40 @@
 const DATA_URL = "./data/market-data.json";
-const LIVE_RANGE = "6mo";
-const LIVE_INTERVAL = "1d";
-const LIVE_LIMIT = 90;
 const STORAGE_KEY = "stock-dashboard:addedSymbols";
+const MARKET_INDEX_SYMBOL = "^GSPC";
+const MARKET_INDEX_LABEL = "S&P 500";
 
 // Yahoo Finance's chart API does not send CORS headers for arbitrary origins,
 // so a direct browser fetch from a page hosted elsewhere will fail. We try a
 // direct fetch first (in case it's ever allowed) and fall back to public CORS
-// proxies so typing a brand-new symbol can pull real data on the spot.
+// proxies so typing a brand-new symbol, or switching to a weekly/monthly
+// timeframe, can pull real data on the spot.
 const CORS_PROXIES = [
   (url) => url,
   (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
   (url) => `https://corsproxy.io/?url=${encodeURIComponent(url)}`,
 ];
 
+// Per-timeframe fetch config. Weekly/monthly need a longer range so there is
+// enough history for the 9/3/3 KD warm-up plus 30 chart points.
+const TIMEFRAME_CONFIG = {
+  daily: { interval: "1d", range: "6mo", limit: 90, label: "日線", chartLabel: "近 30 筆日線資料" },
+  weekly: { interval: "1wk", range: "5y", limit: 104, label: "週線", chartLabel: "近 30 筆週線資料" },
+  monthly: { interval: "1mo", range: "10y", limit: 60, label: "月線", chartLabel: "近 30 筆月線資料" },
+};
+
 const state = {
   data: null,
   currentSymbol: null,
+  currentTimeframe: "daily",
   visibleSymbols: [],
+  market: { status: "loading", trend: null, note: "" },
 };
 
 const els = {
   generatedAt: document.querySelector("#generatedAt"),
   sourceName: document.querySelector("#sourceName"),
   symbolSelect: document.querySelector("#symbolSelect"),
+  timeframeSelect: document.querySelector("#timeframeSelect"),
   addSymbolForm: document.querySelector("#addSymbolForm"),
   symbolInput: document.querySelector("#symbolInput"),
   addSymbolBtn: document.querySelector("#addSymbolBtn"),
@@ -35,6 +46,7 @@ const els = {
   latestKd: document.querySelector("#latestKd"),
   latestVolumeChange: document.querySelector("#latestVolumeChange"),
   chartTitle: document.querySelector("#chartTitle"),
+  chartSubtitle: document.querySelector("#chartSubtitle"),
   signalBadge: document.querySelector("#signalBadge"),
   priceChart: document.querySelector("#priceChart"),
   alertsList: document.querySelector("#alertsList"),
@@ -43,6 +55,9 @@ const els = {
   suggestionBadge: document.querySelector("#suggestionBadge"),
   suggestionTitle: document.querySelector("#suggestionTitle"),
   suggestionBody: document.querySelector("#suggestionBody"),
+  marketTrend: document.querySelector("#marketTrend"),
+  valuationContext: document.querySelector("#valuationContext"),
+  riskContext: document.querySelector("#riskContext"),
 };
 
 function formatNumber(value, digits = 2) {
@@ -88,6 +103,12 @@ function getSelectedPayload() {
   return state.data.symbols[state.currentSymbol];
 }
 
+function getRowsForTimeframe(payload, timeframe) {
+  if (!payload) return null;
+  if (timeframe === "daily") return payload.rows || null;
+  return (payload.timeframes && payload.timeframes[timeframe]) || null;
+}
+
 function latestRows(rows, count) {
   return rows.filter((row) => row.k !== null && row.d !== null).slice(-count);
 }
@@ -100,7 +121,7 @@ function buildAlerts(latest) {
     alerts.push({
       level: latest.volumeChangePct > 0 ? "warning" : "danger",
       title: `成交量變化 ${formatPct(latest.volumeChangePct)}`,
-      body: `相對近 5 日均量 ${formatInteger(latest.volumeMA5)}，已超過 ${thresholds.volume}% 門檻。`,
+      body: `相對近 5 期均量 ${formatInteger(latest.volumeMA5)}，已超過 ${thresholds.volume}% 門檻。`,
     });
   }
 
@@ -124,24 +145,25 @@ function buildAlerts(latest) {
     alerts.push({
       level: "ok",
       title: "KD 短線偏多",
-      body: `K 高於 D，且 K 較前一日增加 ${formatNumber(latest.kChange)}。`,
+      body: `K 高於 D，且 K 較前一期增加 ${formatNumber(latest.kChange)}。`,
     });
   } else if (latest.k < latest.d && latest.kChange < 0) {
     alerts.push({
       level: "danger",
       title: "KD 短線偏弱",
-      body: `K 低於 D，且 K 較前一日下降 ${formatNumber(Math.abs(latest.kChange))}。`,
+      body: `K 低於 D，且 K 較前一期下降 ${formatNumber(Math.abs(latest.kChange))}。`,
     });
   }
 
   return alerts;
 }
 
-// ---- Rule-based buy/sell suggestion (KD golden/death cross) ----
+// ---- Rule-based buy/sell suggestion (KD golden/death cross + market filter) ----
 // This is a mechanical technical-indicator signal only. It is not investment
-// advice, does not account for fundamentals, broader market context, or risk
-// management, and false signals are common in choppy markets. Treat it as one
-// input among many, not a recommendation to act on.
+// advice, does not account for a company's fundamentals in depth, your
+// position size, or your personal risk tolerance. False signals are common
+// in choppy markets — treat it as one input among many, not a recommendation
+// to act on.
 
 function buildSuggestion(rows) {
   const thresholds = getThresholds();
@@ -162,12 +184,27 @@ function buildSuggestion(rows) {
     ? "但成交量同步萎縮，訊號力道較弱。"
     : "";
 
+  const marketTrend = state.market.trend;
+  const marketNoteFor = (direction) => {
+    if (marketTrend === null) return "";
+    if (direction === "buy") {
+      return marketTrend === "bull"
+        ? `大盤（${MARKET_INDEX_LABEL}）同步偏多，訊號較有支撐。`
+        : `但大盤（${MARKET_INDEX_LABEL}）目前偏空，逆勢操作風險較高，訊號可信度較低。`;
+    }
+    return marketTrend === "bear"
+      ? `大盤（${MARKET_INDEX_LABEL}）同步偏空，訊號較有支撐。`
+      : `但大盤（${MARKET_INDEX_LABEL}）目前偏多，逆勢操作風險較高，訊號可信度較低。`;
+  };
+
   if (goldenCross) {
     const strong = latest.k <= thresholds.kdLow || latest.d <= thresholds.kdLow;
     return {
       signal: "buy",
       title: strong ? "偏多訊號：低檔黃金交叉" : "偏多訊號：黃金交叉",
-      body: `K 由 ${formatNumber(prev.k)} 上穿 D（D：${formatNumber(prev.d)} → ${formatNumber(latest.d)}）。${volumeNote}`,
+      body: `K 由 ${formatNumber(prev.k)} 上穿 D（D：${formatNumber(prev.d)} → ${formatNumber(latest.d)}）。${volumeNote} ${marketNoteFor(
+        "buy"
+      )}`.trim(),
     };
   }
 
@@ -176,7 +213,9 @@ function buildSuggestion(rows) {
     return {
       signal: "sell",
       title: strong ? "偏空訊號：高檔死亡交叉" : "偏空訊號：死亡交叉",
-      body: `K 由 ${formatNumber(prev.k)} 下穿 D（D：${formatNumber(prev.d)} → ${formatNumber(latest.d)}）。${volumeNote}`,
+      body: `K 由 ${formatNumber(prev.k)} 下穿 D（D：${formatNumber(prev.d)} → ${formatNumber(latest.d)}）。${volumeNote} ${marketNoteFor(
+        "sell"
+      )}`.trim(),
     };
   }
 
@@ -199,8 +238,59 @@ function renderSuggestion(rows) {
   els.suggestionBody.textContent = suggestion.body;
 }
 
+function renderMarketContext() {
+  if (state.market.status === "loading") {
+    els.marketTrend.textContent = "載入中…";
+    return;
+  }
+  if (state.market.status === "error") {
+    els.marketTrend.textContent = "無法取得大盤資料";
+    return;
+  }
+  const label = state.market.trend === "bull" ? "偏多" : "偏空";
+  els.marketTrend.textContent = `${label}（現價 ${state.market.trend === "bull" ? "高於" : "低於"} 20 期均線 ${formatPct(
+    state.market.pct
+  )}）`;
+}
+
+function renderValuationContext(payload) {
+  const high = payload && payload.fiftyTwoWeekHigh;
+  const low = payload && payload.fiftyTwoWeekLow;
+  const rows = payload && payload.rows;
+  const latestDaily = rows ? latestRows(rows, 1)[0] : null;
+  if (!high || !low || !latestDaily || high === low) {
+    els.valuationContext.textContent = "載入中…";
+    return;
+  }
+  const pos = ((latestDaily.close - low) / (high - low)) * 100;
+  els.valuationContext.textContent = `位於區間 ${formatNumber(pos, 0)}%（低 ${formatNumber(low)} / 高 ${formatNumber(high)}）`;
+}
+
+function computeRisk(rows) {
+  const sample = latestRows(rows, 14).filter((row) => row.high != null && row.low != null && row.close);
+  if (!sample.length) return null;
+  const avgRangePct = sample.reduce((sum, row) => sum + Math.abs(row.high - row.low) / row.close, 0) / sample.length;
+  const swingSample = latestRows(rows, 20);
+  const swingLow = Math.min(...swingSample.map((row) => row.low).filter((v) => v != null));
+  const swingHigh = Math.max(...swingSample.map((row) => row.high).filter((v) => v != null));
+  return { avgRangePct: avgRangePct * 100, swingLow, swingHigh };
+}
+
+function renderRiskContext(rows) {
+  const risk = computeRisk(rows);
+  if (!risk) {
+    els.riskContext.textContent = "--";
+    return;
+  }
+  els.riskContext.textContent = `日均波動 ${formatNumber(risk.avgRangePct, 1)}%，近期區間 ${formatNumber(
+    risk.swingLow
+  )} ~ ${formatNumber(risk.swingHigh)}`;
+}
+
 function renderSummary(payload, latest) {
+  const tfLabel = TIMEFRAME_CONFIG[state.currentTimeframe].label;
   els.chartTitle.textContent = `${payload.symbol} ${payload.name || ""}`.trim();
+  els.chartSubtitle.textContent = TIMEFRAME_CONFIG[state.currentTimeframe].chartLabel;
   els.latestClose.textContent = `${formatNumber(latest.close)} ${payload.currency || "USD"}`;
   els.latestVolume.textContent = formatInteger(latest.volume);
   els.latestKd.textContent = `${formatNumber(latest.k)} / ${formatNumber(latest.d)}`;
@@ -208,12 +298,8 @@ function renderSummary(payload, latest) {
   setClassBySign(els.latestVolumeChange, latest.volumeChangePct);
 
   els.signalBadge.className = "badge";
-  if (latest.k > latest.d) {
-    els.signalBadge.textContent = "K > D";
-  } else {
-    els.signalBadge.textContent = "K < D";
-    els.signalBadge.classList.add("warning");
-  }
+  els.signalBadge.textContent = `${tfLabel}｜${latest.k > latest.d ? "K > D" : "K < D"}`;
+  if (latest.k <= latest.d) els.signalBadge.classList.add("warning");
 }
 
 function renderAlerts(latest) {
@@ -310,16 +396,57 @@ function renderChart(rows) {
   svg.insertAdjacentHTML("beforeend", `<text class="chart-label" text-anchor="end" x="${width - pad.right}" y="${height - 16}">${last.date}</text>`);
 }
 
-function renderSymbol() {
+async function renderSymbol() {
   const payload = getSelectedPayload();
-  if (!payload || !payload.rows.length) return;
-  const rows = payload.rows;
+  if (!payload) return;
+
+  const timeframe = state.currentTimeframe;
+  let rows = getRowsForTimeframe(payload, timeframe);
+
+  if (!rows) {
+    els.chartTitle.textContent = `${payload.symbol} 載入${TIMEFRAME_CONFIG[timeframe].label}資料中…`;
+    try {
+      rows = await ensureTimeframe(state.currentSymbol, timeframe);
+    } catch (err) {
+      els.chartTitle.textContent = `${payload.symbol}：載入${TIMEFRAME_CONFIG[timeframe].label}資料失敗`;
+      setHint(`載入 ${payload.symbol} 的${TIMEFRAME_CONFIG[timeframe].label}資料失敗：${err.message || err}`, "error");
+      return;
+    }
+  }
+
+  if (state.currentSymbol !== payload.symbol || state.currentTimeframe !== timeframe) return; // stale response
+  if (!rows || !rows.length) return;
+
   const latest = latestRows(rows, 1)[0];
   renderSummary(payload, latest);
   renderSuggestion(rows);
+  renderMarketContext();
+  renderValuationContext(payload);
+  renderRiskContext(rows);
   renderAlerts(latest);
   renderTable(rows);
   renderChart(rows);
+
+  if (!payload.fiftyTwoWeekHigh || !payload.fiftyTwoWeekLow) backfillFiftyTwoWeek(payload);
+}
+
+// Pre-baked default symbols ship without 52-week meta (only computed rows).
+// Fetch it once, lazily, in the background so the valuation context card
+// fills in without blocking the initial render.
+let backfillInFlight = new Set();
+async function backfillFiftyTwoWeek(payload) {
+  if (backfillInFlight.has(payload.symbol)) return;
+  backfillInFlight.add(payload.symbol);
+  try {
+    const { meta } = await fetchChart(payload.symbol, TIMEFRAME_CONFIG.daily);
+    if (meta.fiftyTwoWeekHigh) payload.fiftyTwoWeekHigh = meta.fiftyTwoWeekHigh;
+    if (meta.fiftyTwoWeekLow) payload.fiftyTwoWeekLow = meta.fiftyTwoWeekLow;
+    if (state.currentSymbol === payload.symbol) renderValuationContext(payload);
+  } catch {
+    // best-effort only; leave the "no data yet" message in place
+  } finally {
+    backfillInFlight.delete(payload.symbol);
+  }
 }
 
 function hydrateSymbolSelect() {
@@ -415,7 +542,7 @@ function computeIndicatorRows(rawRows) {
   }));
 }
 
-// ---- Live fetch of a brand-new symbol ----
+// ---- Live fetch (any symbol, any timeframe) ----
 
 async function fetchViaProxies(url) {
   let lastError = null;
@@ -435,13 +562,11 @@ async function fetchViaProxies(url) {
   throw lastError || new Error("所有連線方式都失敗");
 }
 
-async function fetchLiveSymbol(symbol) {
-  const url = `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=${LIVE_RANGE}&interval=${LIVE_INTERVAL}`;
+async function fetchChart(symbol, timeframeConfig) {
+  const url = `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=${timeframeConfig.range}&interval=${timeframeConfig.interval}`;
   const json = await fetchViaProxies(url);
   const chartError = json && json.chart && json.chart.error;
-  if (chartError) {
-    throw new Error(chartError.description || "查無此股票代號");
-  }
+  if (chartError) throw new Error(chartError.description || "查無此股票代號");
   const result = json && json.chart && json.chart.result && json.chart.result[0];
   if (!result) throw new Error("查無此股票代號");
 
@@ -465,18 +590,65 @@ async function fetchLiveSymbol(symbol) {
     }).format(new Date(ts[i] * 1000));
     rawRows.push({ date: dateStr, open: o, high: h, low: l, close: c, volume: v });
   }
-  if (!rawRows.length) throw new Error("查無此股票代號的日線資料");
+  if (!rawRows.length) throw new Error("查無此股票代號的資料");
 
   const fullRows = computeIndicatorRows(rawRows);
-  const rows = fullRows.slice(Math.max(0, fullRows.length - LIVE_LIMIT));
+  const rows = fullRows.slice(Math.max(0, fullRows.length - timeframeConfig.limit));
 
+  return { meta, rows };
+}
+
+async function fetchLiveSymbol(symbol) {
+  const { meta, rows } = await fetchChart(symbol, TIMEFRAME_CONFIG.daily);
   return {
     symbol,
     name: meta.shortName || meta.longName || symbol,
     currency: meta.currency || "USD",
     exchange: meta.fullExchangeName || meta.exchangeName,
+    fiftyTwoWeekHigh: meta.fiftyTwoWeekHigh || null,
+    fiftyTwoWeekLow: meta.fiftyTwoWeekLow || null,
     rows,
+    timeframes: {},
   };
+}
+
+// Ensures payload.rows (daily) / payload.timeframes[tf] (weekly, monthly) is
+// populated for the given symbol+timeframe, fetching live if needed. Also
+// opportunistically backfills the 52-week high/low used for the valuation
+// context card, since pre-baked default symbols don't carry it yet.
+async function ensureTimeframe(symbol, timeframe) {
+  const payload = state.data.symbols[symbol];
+  const existing = getRowsForTimeframe(payload, timeframe);
+  if (existing) return existing;
+
+  const { meta, rows } = await fetchChart(symbol, TIMEFRAME_CONFIG[timeframe]);
+  if (!payload.fiftyTwoWeekHigh && meta.fiftyTwoWeekHigh) payload.fiftyTwoWeekHigh = meta.fiftyTwoWeekHigh;
+  if (!payload.fiftyTwoWeekLow && meta.fiftyTwoWeekLow) payload.fiftyTwoWeekLow = meta.fiftyTwoWeekLow;
+
+  if (timeframe === "daily") {
+    payload.rows = rows;
+  } else {
+    payload.timeframes = payload.timeframes || {};
+    payload.timeframes[timeframe] = rows;
+  }
+  return rows;
+}
+
+async function refreshMarketTrend() {
+  try {
+    const { rows } = await fetchChart(MARKET_INDEX_SYMBOL, TIMEFRAME_CONFIG.daily);
+    const closes = rows.map((r) => r.close).filter((v) => v != null);
+    const sample = closes.slice(-20);
+    if (!sample.length) throw new Error("no data");
+    const sma20 = sample.reduce((a, b) => a + b, 0) / sample.length;
+    const lastClose = closes[closes.length - 1];
+    const pct = ((lastClose - sma20) / sma20) * 100;
+    state.market = { status: "ready", trend: lastClose >= sma20 ? "bull" : "bear", pct };
+  } catch (err) {
+    state.market = { status: "error", trend: null, pct: null };
+  }
+  renderMarketContext();
+  renderSymbol();
 }
 
 function loadStoredSymbols() {
@@ -520,6 +692,8 @@ async function addSymbol(rawSymbol) {
     state.data.symbols[symbol] = payload;
     state.visibleSymbols.push(symbol);
     state.currentSymbol = symbol;
+    state.currentTimeframe = "daily";
+    els.timeframeSelect.value = "daily";
     persistStoredSymbol(symbol, payload);
     hydrateSymbolSelect();
     renderSymbol();
@@ -548,6 +722,9 @@ async function init() {
   for (const [symbol, payload] of Object.entries(stored)) {
     if (!state.data.symbols[symbol]) state.data.symbols[symbol] = payload;
   }
+  for (const payload of Object.values(state.data.symbols)) {
+    if (!payload.timeframes) payload.timeframes = {};
+  }
 
   state.visibleSymbols = Object.keys(state.data.symbols);
   state.currentSymbol = state.visibleSymbols[0];
@@ -556,10 +733,16 @@ async function init() {
   els.sourceName.textContent = state.data.source || "";
   renderPrivateCompanies();
   renderSymbol();
+  refreshMarketTrend();
 }
 
 els.symbolSelect.addEventListener("change", (event) => {
   state.currentSymbol = event.target.value;
+  renderSymbol();
+});
+
+els.timeframeSelect.addEventListener("change", (event) => {
+  state.currentTimeframe = event.target.value;
   renderSymbol();
 });
 
