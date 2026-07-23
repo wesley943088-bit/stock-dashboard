@@ -1,0 +1,13 @@
+{
+  "symbols": ["MU", "GOOGL", "NVDA", "AMD", "TSM", "AAPL"],
+  "privateCompanies": [
+    {
+      "name": "SpaceX",
+      "reason": "未上市，沒有公開美股代號，無法取得成交量與 KD。"
+    },
+    {
+      "name": "Anthropic",
+      "reason": "未上市，沒有公開美股代號，無法取得成交量與 KD。"
+    }
+  ]
+}
