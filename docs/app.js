@@ -40,6 +40,9 @@ const els = {
   alertsList: document.querySelector("#alertsList"),
   addHint: document.querySelector("#addHint"),
   dataRows: document.querySelector("#dataRows"),
+  suggestionBadge: document.querySelector("#suggestionBadge"),
+  suggestionTitle: document.querySelector("#suggestionTitle"),
+  suggestionBody: document.querySelector("#suggestionBody"),
 };
 
 function formatNumber(value, digits = 2) {
@@ -132,6 +135,68 @@ function buildAlerts(latest) {
   }
 
   return alerts;
+}
+
+// ---- Rule-based buy/sell suggestion (KD golden/death cross) ----
+// This is a mechanical technical-indicator signal only. It is not investment
+// advice, does not account for fundamentals, broader market context, or risk
+// management, and false signals are common in choppy markets. Treat it as one
+// input among many, not a recommendation to act on.
+
+function buildSuggestion(rows) {
+  const thresholds = getThresholds();
+  const recent = latestRows(rows, 2);
+
+  if (recent.length < 2) {
+    return { signal: "hold", title: "資料不足", body: "近期資料不足以判斷 KD 交叉。" };
+  }
+
+  const [prev, latest] = recent;
+  const goldenCross = prev.k <= prev.d && latest.k > latest.d;
+  const deathCross = prev.k >= prev.d && latest.k < latest.d;
+  const volumeConfirm = (latest.volumeChangePct || 0) >= thresholds.volume;
+  const volumeFade = (latest.volumeChangePct || 0) <= -thresholds.volume;
+  const volumeNote = volumeConfirm
+    ? "成交量同步放大，訊號較有支撐。"
+    : volumeFade
+    ? "但成交量同步萎縮，訊號力道較弱。"
+    : "";
+
+  if (goldenCross) {
+    const strong = latest.k <= thresholds.kdLow || latest.d <= thresholds.kdLow;
+    return {
+      signal: "buy",
+      title: strong ? "偏多訊號：低檔黃金交叉" : "偏多訊號：黃金交叉",
+      body: `K 由 ${formatNumber(prev.k)} 上穿 D（D：${formatNumber(prev.d)} → ${formatNumber(latest.d)}）。${volumeNote}`,
+    };
+  }
+
+  if (deathCross) {
+    const strong = latest.k >= thresholds.kdHigh || latest.d >= thresholds.kdHigh;
+    return {
+      signal: "sell",
+      title: strong ? "偏空訊號：高檔死亡交叉" : "偏空訊號：死亡交叉",
+      body: `K 由 ${formatNumber(prev.k)} 下穿 D（D：${formatNumber(prev.d)} → ${formatNumber(latest.d)}）。${volumeNote}`,
+    };
+  }
+
+  return {
+    signal: "hold",
+    title: "觀望：無交叉訊號",
+    body: `最新 K=${formatNumber(latest.k)}, D=${formatNumber(latest.d)}，未偵測到黃金或死亡交叉。`,
+  };
+}
+
+function renderSuggestion(rows) {
+  const suggestion = buildSuggestion(rows);
+  els.suggestionBadge.className = "badge";
+  const labels = { buy: "建議買進", sell: "建議賣出", hold: "觀望" };
+  const badgeClass = { buy: "success", sell: "danger", hold: "" };
+  els.suggestionBadge.textContent = labels[suggestion.signal];
+  if (badgeClass[suggestion.signal]) els.suggestionBadge.classList.add(badgeClass[suggestion.signal]);
+  els.suggestionTitle.textContent = suggestion.title;
+  els.suggestionTitle.className = `suggestion-title ${suggestion.signal}`;
+  els.suggestionBody.textContent = suggestion.body;
 }
 
 function renderSummary(payload, latest) {
@@ -251,6 +316,7 @@ function renderSymbol() {
   const rows = payload.rows;
   const latest = latestRows(rows, 1)[0];
   renderSummary(payload, latest);
+  renderSuggestion(rows);
   renderAlerts(latest);
   renderTable(rows);
   renderChart(rows);

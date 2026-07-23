@@ -229,6 +229,40 @@ button:disabled {
   color: var(--red);
 }
 
+.badge.success {
+  background: #e5f6ef;
+  color: var(--green);
+}
+
+.suggestion-panel {
+  margin-bottom: 16px;
+}
+
+.suggestion-title {
+  font-size: 16px;
+  font-weight: 800;
+  margin: 4px 0 6px;
+}
+
+.suggestion-title.buy {
+  color: var(--green);
+}
+
+.suggestion-title.sell {
+  color: var(--red);
+}
+
+.suggestion-title.hold {
+  color: var(--muted);
+}
+
+.hint.disclaimer {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+  font-size: 12px;
+}
+
 #priceChart {
   width: 100%;
   height: 410px;
