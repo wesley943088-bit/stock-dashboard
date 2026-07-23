@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>美股成交量與 KD 監控</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">US Stock Monitor</p>
+          <h1>成交量與 KD 儀表板</h1>
+        </div>
+        <div class="status">
+          <span id="generatedAt">資料載入中</span>
+          <span id="sourceName"></span>
+        </div>
+      </header>
+
+      <section class="controls" aria-label="股票選擇">
+        <label>
+          股票代號
+          <select id="symbolSelect"></select>
+        </label>
+        <form id="addSymbolForm">
+          <label>
+            新增觀察（可輸入任意美股代號）
+            <input id="symbolInput" name="symbol" placeholder="例如 AAPL" autocomplete="off" />
+          </label>
+          <button type="submit" id="addSymbolBtn">加入</button>
+        </form>
+        <div class="thresholds">
+          <label>
+            量能警示
+            <input id="volumeThreshold" type="number" min="1" max="100" value="15" />
+            <span>%</span>
+          </label>
+          <label>
+            KD 高檔
+            <input id="kdHigh" type="number" min="50" max="100" value="80" />
+          </label>
+          <label>
+            KD 低檔
+            <input id="kdLow" type="number" min="0" max="50" value="20" />
+          </label>
+        </div>
+      </section>
+
+      <section class="summary" aria-label="重點摘要">
+        <article>
+          <span>最新收盤</span>
+          <strong id="latestClose">--</strong>
+        </article>
+        <article>
+          <span>最新成交量</span>
+          <strong id="latestVolume">--</strong>
+        </article>
+        <article>
+          <span>K / D</span>
+          <strong id="latestKd">--</strong>
+        </article>
+        <article>
+          <span>量能變化</span>
+          <strong id="latestVolumeChange">--</strong>
+        </article>
+      </section>
+
+      <section class="dashboard">
+        <div class="panel chart-panel">
+          <div class="panel-head">
+            <div>
+              <h2 id="chartTitle">走勢</h2>
+              <p>近 30 筆日線資料</p>
+            </div>
+            <div id="signalBadge" class="badge">--</div>
+          </div>
+          <svg id="priceChart" role="img" aria-label="價格、KD 與成交量圖表"></svg>
+        </div>
+
+        <aside class="panel alerts">
+          <div class="panel-head">
+            <div>
+              <h2>示警條件</h2>
+              <p>依最新交易日判斷</p>
+            </div>
+          </div>
+          <ul id="alertsList"></ul>
+          <p class="hint" id="addHint"></p>
+        </aside>
+      </section>
+
+      <section class="panel table-panel">
+        <div class="panel-head">
+          <div>
+            <h2>最近 5 個交易日</h2>
+            <p>成交量、KD 與變化量</p>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>日期</th>
+                <th>收盤</th>
+                <th>成交量</th>
+                <th>K</th>
+                <th>D</th>
+                <th>K 變化</th>
+                <th>D 變化</th>
+                <th>量 vs 5日均量</th>
+              </tr>
+            </thead>
+            <tbody id="dataRows"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
