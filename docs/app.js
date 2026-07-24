@@ -91,6 +91,7 @@ const els = {
   valuationContext: document.querySelector("#valuationContext"),
   riskContext: document.querySelector("#riskContext"),
   fundamentalsContext: document.querySelector("#fundamentalsContext"),
+  indicatorContext: document.querySelector("#indicatorContext"),
 };
 
 function formatNumber(value, digits = 2) {
@@ -198,6 +199,71 @@ function buildAlerts(latest) {
 // in choppy markets — treat it as one input among many, not a recommendation
 // to act on.
 
+// RSI/MACD are used here only as *confirmation* on top of the KD cross —
+// they don't add a new independent trigger, and they don't predict
+// anything. They're the same class of lagging/coincident indicator as KD,
+// just computed a different way, so "multiple indicators agree" just means
+// "multiple ways of reading the same recent price action agree", not that
+// the outcome is more likely to be correct.
+
+function classifyRSI(rsi) {
+  if (rsi == null) return null;
+  if (rsi >= 70) return "超買";
+  if (rsi <= 30) return "超賣";
+  return "中性";
+}
+
+function macdTrendState(prevHist, latestHist) {
+  if (prevHist == null || latestHist == null) return null;
+  if (prevHist <= 0 && latestHist > 0) return "goldenCross";
+  if (prevHist >= 0 && latestHist < 0) return "deathCross";
+  return latestHist > 0 ? "bullish" : latestHist < 0 ? "bearish" : "flat";
+}
+
+function confirmationsFor(direction, prev, latest) {
+  const notes = [];
+  let agree = 0;
+  let total = 0;
+
+  const macdState = macdTrendState(prev.macdHist, latest.macdHist);
+  if (macdState != null) {
+    total++;
+    const bull = macdState === "goldenCross" || macdState === "bullish";
+    const bear = macdState === "deathCross" || macdState === "bearish";
+    if (direction === "buy" && bull) {
+      agree++;
+      notes.push(macdState === "goldenCross" ? "MACD 同步翻多" : "MACD 柱狀圖同步偏多");
+    } else if (direction === "sell" && bear) {
+      agree++;
+      notes.push(macdState === "deathCross" ? "MACD 同步翻空" : "MACD 柱狀圖同步偏空");
+    } else {
+      notes.push("但 MACD 尚未同步轉向");
+    }
+  }
+
+  if (latest.rsi != null) {
+    total++;
+    const label = classifyRSI(latest.rsi);
+    if (direction === "buy") {
+      if (latest.rsi >= 70) {
+        notes.push(`RSI ${formatNumber(latest.rsi, 1)} 已達超買，追高風險較高`);
+      } else {
+        agree++;
+        notes.push(`RSI ${formatNumber(latest.rsi, 1)}（${label}）尚未過熱`);
+      }
+    } else {
+      if (latest.rsi <= 30) {
+        notes.push(`RSI ${formatNumber(latest.rsi, 1)} 已達超賣，追空風險較高`);
+      } else {
+        agree++;
+        notes.push(`RSI ${formatNumber(latest.rsi, 1)}（${label}）尚未過冷`);
+      }
+    }
+  }
+
+  return { agree, total, notes };
+}
+
 function buildSuggestion(rows, payload) {
   const thresholds = getThresholds();
   const recent = latestRows(rows, 2);
@@ -234,30 +300,37 @@ function buildSuggestion(rows, payload) {
 
   if (goldenCross) {
     const strong = latest.k <= thresholds.kdLow || latest.d <= thresholds.kdLow;
+    const confirm = confirmationsFor("buy", prev, latest);
+    const confirmSuffix = confirm.total ? `（${confirm.agree}/${confirm.total} 項指標同向）` : "";
     return {
       signal: "buy",
-      title: strong ? "偏多訊號：低檔黃金交叉" : "偏多訊號：黃金交叉",
+      title: `${strong ? "偏多訊號：低檔黃金交叉" : "偏多訊號：黃金交叉"}${confirmSuffix}`,
       body: `K 由 ${formatNumber(prev.k)} 上穿 D（D：${formatNumber(prev.d)} → ${formatNumber(latest.d)}）。${volumeNote} ${marketNoteFor(
         "buy"
-      )}`.trim(),
+      )} ${confirm.notes.join("；")}`.trim(),
     };
   }
 
   if (deathCross) {
     const strong = latest.k >= thresholds.kdHigh || latest.d >= thresholds.kdHigh;
+    const confirm = confirmationsFor("sell", prev, latest);
+    const confirmSuffix = confirm.total ? `（${confirm.agree}/${confirm.total} 項指標同向）` : "";
     return {
       signal: "sell",
-      title: strong ? "偏空訊號：高檔死亡交叉" : "偏空訊號：死亡交叉",
+      title: `${strong ? "偏空訊號：高檔死亡交叉" : "偏空訊號：死亡交叉"}${confirmSuffix}`,
       body: `K 由 ${formatNumber(prev.k)} 下穿 D（D：${formatNumber(prev.d)} → ${formatNumber(latest.d)}）。${volumeNote} ${marketNoteFor(
         "sell"
-      )}`.trim(),
+      )} ${confirm.notes.join("；")}`.trim(),
     };
   }
 
+  const rsiPart = latest.rsi != null ? `RSI ${formatNumber(latest.rsi, 1)}（${classifyRSI(latest.rsi)}）` : "";
+  const macdPart = latest.macdHist != null ? `MACD 柱狀圖 ${formatNumber(latest.macdHist, 2)}` : "";
+  const extra = [rsiPart, macdPart].filter(Boolean).join("｜");
   return {
     signal: "hold",
     title: "觀望：無交叉訊號",
-    body: `最新 K=${formatNumber(latest.k)}, D=${formatNumber(latest.d)}，未偵測到黃金或死亡交叉。`,
+    body: `最新 K=${formatNumber(latest.k)}, D=${formatNumber(latest.d)}，未偵測到黃金或死亡交叉。${extra}`.trim(),
   };
 }
 
@@ -322,6 +395,21 @@ function renderRiskContext(rows) {
   els.riskContext.textContent = `日均波動 ${formatNumber(risk.avgRangePct, 1)}%，近期區間 ${formatNumber(
     risk.swingLow
   )} ~ ${formatNumber(risk.swingHigh)}`;
+}
+
+// RSI/MACD raw readout, shown regardless of whether a KD cross fired, so you
+// can see the underlying numbers the confirmation notes in the suggestion
+// panel are based on. Same lagging/coincident caveat as everything else here.
+function renderIndicatorContext(rows) {
+  const latest = latestRows(rows, 1)[0];
+  if (!latest) {
+    els.indicatorContext.textContent = "--";
+    return;
+  }
+  const parts = [];
+  if (latest.rsi != null) parts.push(`RSI ${formatNumber(latest.rsi, 1)}（${classifyRSI(latest.rsi)}）`);
+  if (latest.macdHist != null) parts.push(`MACD 柱狀圖 ${formatNumber(latest.macdHist, 2)}`);
+  els.indicatorContext.textContent = parts.length ? parts.join("｜") : "資料不足";
 }
 
 // ---- Fundamentals (本益比 / EPS / 市值 ...) via the Cloudflare Worker ----
@@ -499,6 +587,7 @@ async function renderSymbol() {
   renderMarketContext(benchmark);
   renderValuationContext(payload);
   renderRiskContext(rows);
+  renderIndicatorContext(rows);
   renderFundamentals(payload);
   renderAlerts(latest);
   renderTable(rows);
@@ -592,6 +681,61 @@ function diffArr(arr) {
   });
 }
 
+// RSI(14), Wilder smoothing — standard formulation. Like KD, this is a
+// lagging/coincident momentum reading (it describes recent gains vs losses),
+// not a forecast of future price direction.
+function computeRSI(closes, period = 14) {
+  const rsi = new Array(closes.length).fill(null);
+  const gains = [];
+  const losses = [];
+  for (let i = 1; i < closes.length; i++) {
+    const diff = closes[i] - closes[i - 1];
+    gains.push(Math.max(diff, 0));
+    losses.push(Math.max(-diff, 0));
+  }
+  if (gains.length < period) return rsi;
+
+  let avgGain = gains.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  let avgLoss = losses.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  rsi[period] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
+
+  for (let i = period; i < gains.length; i++) {
+    avgGain = (avgGain * (period - 1) + gains[i]) / period;
+    avgLoss = (avgLoss * (period - 1) + losses[i]) / period;
+    rsi[i + 1] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
+  }
+  return rsi;
+}
+
+// Simple EMA seeded with the first value (rather than an SMA warm-up) to
+// keep the implementation simple; converges within a few periods, which is
+// fine for a 90+ row series used only as a directional confirmation signal.
+function ema(arr, period) {
+  const k = 2 / (period + 1);
+  const out = new Array(arr.length).fill(null);
+  let prev = null;
+  for (let i = 0; i < arr.length; i++) {
+    if (arr[i] == null) {
+      out[i] = null;
+      continue;
+    }
+    prev = prev === null ? arr[i] : arr[i] * k + prev * (1 - k);
+    out[i] = prev;
+  }
+  return out;
+}
+
+// MACD(12, 26, 9) — also a lagging/coincident trend-following indicator
+// derived from moving averages, not a predictive one.
+function computeMACD(closes) {
+  const ema12 = ema(closes, 12);
+  const ema26 = ema(closes, 26);
+  const macdLine = closes.map((_, i) => (ema12[i] != null && ema26[i] != null ? ema12[i] - ema26[i] : null));
+  const signalLine = ema(macdLine, 9);
+  const hist = macdLine.map((v, i) => (v != null && signalLine[i] != null ? v - signalLine[i] : null));
+  return { macdLine, signalLine, hist };
+}
+
 function computeIndicatorRows(rawRows) {
   const lows = rawRows.map((r) => r.low);
   const highs = rawRows.map((r) => r.high);
@@ -615,6 +759,8 @@ function computeIndicatorRows(rawRows) {
     if (volumeMA5[i] === null || volumeMA5[i] === 0) return null;
     return ((v - volumeMA5[i]) / volumeMA5[i]) * 100;
   });
+  const rsi = computeRSI(closes, 14);
+  const { macdLine, signalLine, hist } = computeMACD(closes);
 
   return rawRows.map((r, i) => ({
     date: r.date,
@@ -629,6 +775,10 @@ function computeIndicatorRows(rawRows) {
     dChange: round4(dChange[i]),
     volumeMA5: round4(volumeMA5[i]),
     volumeChangePct: round4(volumeChangePct[i]),
+    rsi: round4(rsi[i]),
+    macd: round4(macdLine[i]),
+    macdSignal: round4(signalLine[i]),
+    macdHist: round4(hist[i]),
   }));
 }
 
