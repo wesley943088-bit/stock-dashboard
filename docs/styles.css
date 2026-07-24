@@ -81,6 +81,15 @@ h2 {
   text-align: right;
 }
 
+.live-status {
+  color: var(--green);
+  font-weight: 700;
+}
+
+.live-status.stale {
+  color: var(--amber);
+}
+
 .controls {
   grid-template-columns: 150px 110px 1fr auto;
   align-items: end;

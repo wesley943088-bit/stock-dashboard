@@ -33,11 +33,22 @@ const CORS_PROXIES = [
 
 // Per-timeframe fetch config. Weekly/monthly need a longer range so there is
 // enough history for the 9/3/3 KD warm-up plus 30 chart points.
+// "intraday" pulls Yahoo's 1-minute bars for the current session — this is
+// NOT tick-by-tick real-time (Yahoo's free feed is delayed, and the page
+// only re-polls every REFRESH_INTERVAL_MS), just the closest approximation
+// available without a paid real-time data source.
 const TIMEFRAME_CONFIG = {
+  intraday: { interval: "1m", range: "1d", limit: 120, label: "分線", chartLabel: "當日分線走勢（Yahoo 延遲報價，非逐筆即時，每次自動更新才刷新）" },
   daily: { interval: "1d", range: "6mo", limit: 90, label: "日線", chartLabel: "近 30 筆日線資料" },
   weekly: { interval: "1wk", range: "5y", limit: 104, label: "週線", chartLabel: "近 30 筆週線資料" },
   monthly: { interval: "1mo", range: "10y", limit: 60, label: "月線", chartLabel: "近 30 筆月線資料" },
 };
+
+// How often to silently re-fetch the currently displayed symbol/timeframe in
+// the background so the price/chart keeps itself current without the user
+// having to switch away and back. 45s balances freshness against hammering
+// the Worker / public proxies.
+const REFRESH_INTERVAL_MS = 45000;
 
 const state = {
   data: null,
@@ -50,6 +61,7 @@ const state = {
 const els = {
   generatedAt: document.querySelector("#generatedAt"),
   sourceName: document.querySelector("#sourceName"),
+  liveStatus: document.querySelector("#liveStatus"),
   symbolSelect: document.querySelector("#symbolSelect"),
   timeframeSelect: document.querySelector("#timeframeSelect"),
   addSymbolForm: document.querySelector("#addSymbolForm"),
@@ -779,6 +791,54 @@ async function ensureMarketTrend(benchmark) {
   }
 }
 
+// ---- Background auto-refresh (approximate "live" prices) ----
+// Yahoo's free chart API is not tick-by-tick real-time — it's a delayed
+// quote (typically seconds to a couple of minutes behind, longer for some
+// exchanges). This just re-polls the currently displayed symbol/timeframe
+// on a timer so the page updates itself instead of showing a frozen price
+// until the user manually switches something.
+
+function setLiveStatus(text, stale) {
+  if (!els.liveStatus) return;
+  els.liveStatus.textContent = text;
+  els.liveStatus.classList.toggle("stale", Boolean(stale));
+}
+
+function nowLabel() {
+  return new Date().toLocaleTimeString("zh-TW", { hour12: false });
+}
+
+async function refreshCurrent() {
+  const symbol = state.currentSymbol;
+  const timeframe = state.currentTimeframe;
+  const payload = symbol && state.data && state.data.symbols[symbol];
+  if (!payload) return;
+
+  try {
+    const { meta, rows } = await fetchChart(symbol, TIMEFRAME_CONFIG[timeframe]);
+    if (state.currentSymbol !== symbol || state.currentTimeframe !== timeframe) return; // user moved on
+
+    if (timeframe === "daily") {
+      payload.rows = rows;
+    } else {
+      payload.timeframes = payload.timeframes || {};
+      payload.timeframes[timeframe] = rows;
+    }
+    if (meta.fiftyTwoWeekHigh) payload.fiftyTwoWeekHigh = meta.fiftyTwoWeekHigh;
+    if (meta.fiftyTwoWeekLow) payload.fiftyTwoWeekLow = meta.fiftyTwoWeekLow;
+
+    renderSymbol();
+    setLiveStatus(`自動更新中（每 ${REFRESH_INTERVAL_MS / 1000} 秒）· 最後更新 ${nowLabel()}`, false);
+  } catch (err) {
+    setLiveStatus(`自動更新失敗，${REFRESH_INTERVAL_MS / 1000} 秒後重試 · ${nowLabel()}`, true);
+  }
+}
+
+function startAutoRefresh() {
+  setLiveStatus(`自動更新中（每 ${REFRESH_INTERVAL_MS / 1000} 秒）`, false);
+  setInterval(refreshCurrent, REFRESH_INTERVAL_MS);
+}
+
 function loadStoredSymbols() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
@@ -884,6 +944,7 @@ async function init() {
   els.sourceName.textContent = state.data.source || "";
   renderPrivateCompanies();
   renderSymbol();
+  startAutoRefresh();
 }
 
 els.symbolSelect.addEventListener("change", (event) => {

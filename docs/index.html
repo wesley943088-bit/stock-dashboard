@@ -16,6 +16,7 @@
         <div class="status">
           <span id="generatedAt">資料載入中</span>
           <span id="sourceName"></span>
+          <span id="liveStatus" class="live-status"></span>
         </div>
       </header>
 
@@ -27,6 +28,7 @@
         <label>
           週期
           <select id="timeframeSelect">
+            <option value="intraday">分線（近即時）</option>
             <option value="daily">日線</option>
             <option value="weekly">週線</option>
             <option value="monthly">月線</option>
