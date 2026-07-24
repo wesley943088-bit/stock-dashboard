@@ -46,9 +46,11 @@ const TIMEFRAME_CONFIG = {
 
 // How often to silently re-fetch the currently displayed symbol/timeframe in
 // the background so the price/chart keeps itself current without the user
-// having to switch away and back. 45s balances freshness against hammering
-// the Worker / public proxies.
-const REFRESH_INTERVAL_MS = 45000;
+// having to switch away and back. 15s is close to the fastest sensible
+// cadence for a free, unauthenticated Yahoo feed — going much lower risks
+// getting rate-limited by Yahoo or the public CORS proxies without actually
+// buying you fresher data (Yahoo's own feed isn't tick-by-tick to begin with).
+const REFRESH_INTERVAL_MS = 15000;
 
 const state = {
   data: null,
