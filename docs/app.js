@@ -1,7 +1,24 @@
 const DATA_URL = "./data/market-data.json";
 const STORAGE_KEY = "stock-dashboard:addedSymbols";
-const MARKET_INDEX_SYMBOL = "^GSPC";
-const MARKET_INDEX_LABEL = "S&P 500";
+
+// Cloudflare Worker backend that handles Yahoo's cookie+crumb auth flow for
+// real fundamentals (P/E, EPS, market cap...) and proxies the chart API
+// server-side. Filled in after the Worker is deployed; the site still works
+// without it (fundamentals card just shows "尚未設定後端" and chart fetches
+// fall back to the direct/public-proxy chain).
+const WORKER_BASE_URL = "https://stock-dashboard-proxy.wesley943088.workers.dev";
+
+// Benchmark index used for the "大盤環境" (market environment) context card,
+// picked automatically from the selected stock's currency so Taiwan-listed
+// stocks (.TW/.TWO, currency TWD) compare against the Taiwan weighted index
+// instead of the S&P 500.
+const BENCHMARKS = {
+  USD: { symbol: "^GSPC", label: "S&P 500" },
+  TWD: { symbol: "^TWII", label: "台股加權指數" },
+};
+function benchmarkFor(currency) {
+  return BENCHMARKS[currency] || BENCHMARKS.USD;
+}
 
 // Yahoo Finance's chart API does not send CORS headers for arbitrary origins,
 // so a direct browser fetch from a page hosted elsewhere will fail. We try a
@@ -27,7 +44,7 @@ const state = {
   currentSymbol: null,
   currentTimeframe: "daily",
   visibleSymbols: [],
-  market: { status: "loading", trend: null, note: "" },
+  market: {}, // keyed by benchmark symbol -> { status, trend, pct }
 };
 
 const els = {
@@ -55,9 +72,11 @@ const els = {
   suggestionBadge: document.querySelector("#suggestionBadge"),
   suggestionTitle: document.querySelector("#suggestionTitle"),
   suggestionBody: document.querySelector("#suggestionBody"),
+  marketTrendLabel: document.querySelector("#marketTrendLabel"),
   marketTrend: document.querySelector("#marketTrend"),
   valuationContext: document.querySelector("#valuationContext"),
   riskContext: document.querySelector("#riskContext"),
+  fundamentalsContext: document.querySelector("#fundamentalsContext"),
 };
 
 function formatNumber(value, digits = 2) {
@@ -165,7 +184,7 @@ function buildAlerts(latest) {
 // in choppy markets — treat it as one input among many, not a recommendation
 // to act on.
 
-function buildSuggestion(rows) {
+function buildSuggestion(rows, payload) {
   const thresholds = getThresholds();
   const recent = latestRows(rows, 2);
 
@@ -184,17 +203,19 @@ function buildSuggestion(rows) {
     ? "但成交量同步萎縮，訊號力道較弱。"
     : "";
 
-  const marketTrend = state.market.trend;
+  const benchmark = benchmarkFor(payload && payload.currency);
+  const marketState = state.market[benchmark.symbol];
+  const marketTrend = marketState ? marketState.trend : null;
   const marketNoteFor = (direction) => {
-    if (marketTrend === null) return "";
+    if (marketTrend === null || marketTrend === undefined) return "";
     if (direction === "buy") {
       return marketTrend === "bull"
-        ? `大盤（${MARKET_INDEX_LABEL}）同步偏多，訊號較有支撐。`
-        : `但大盤（${MARKET_INDEX_LABEL}）目前偏空，逆勢操作風險較高，訊號可信度較低。`;
+        ? `大盤（${benchmark.label}）同步偏多，訊號較有支撐。`
+        : `但大盤（${benchmark.label}）目前偏空，逆勢操作風險較高，訊號可信度較低。`;
     }
     return marketTrend === "bear"
-      ? `大盤（${MARKET_INDEX_LABEL}）同步偏空，訊號較有支撐。`
-      : `但大盤（${MARKET_INDEX_LABEL}）目前偏多，逆勢操作風險較高，訊號可信度較低。`;
+      ? `大盤（${benchmark.label}）同步偏空，訊號較有支撐。`
+      : `但大盤（${benchmark.label}）目前偏多，逆勢操作風險較高，訊號可信度較低。`;
   };
 
   if (goldenCross) {
@@ -226,8 +247,8 @@ function buildSuggestion(rows) {
   };
 }
 
-function renderSuggestion(rows) {
-  const suggestion = buildSuggestion(rows);
+function renderSuggestion(rows, payload) {
+  const suggestion = buildSuggestion(rows, payload);
   els.suggestionBadge.className = "badge";
   const labels = { buy: "建議買進", sell: "建議賣出", hold: "觀望" };
   const badgeClass = { buy: "success", sell: "danger", hold: "" };
@@ -238,18 +259,20 @@ function renderSuggestion(rows) {
   els.suggestionBody.textContent = suggestion.body;
 }
 
-function renderMarketContext() {
-  if (state.market.status === "loading") {
+function renderMarketContext(benchmark) {
+  els.marketTrendLabel.textContent = `大盤環境（${benchmark.label}）`;
+  const marketState = state.market[benchmark.symbol];
+  if (!marketState || marketState.status === "loading") {
     els.marketTrend.textContent = "載入中…";
     return;
   }
-  if (state.market.status === "error") {
+  if (marketState.status === "error") {
     els.marketTrend.textContent = "無法取得大盤資料";
     return;
   }
-  const label = state.market.trend === "bull" ? "偏多" : "偏空";
-  els.marketTrend.textContent = `${label}（現價 ${state.market.trend === "bull" ? "高於" : "低於"} 20 期均線 ${formatPct(
-    state.market.pct
+  const label = marketState.trend === "bull" ? "偏多" : "偏空";
+  els.marketTrend.textContent = `${label}（現價 ${marketState.trend === "bull" ? "高於" : "低於"} 20 期均線 ${formatPct(
+    marketState.pct
   )}）`;
 }
 
@@ -285,6 +308,39 @@ function renderRiskContext(rows) {
   els.riskContext.textContent = `日均波動 ${formatNumber(risk.avgRangePct, 1)}%，近期區間 ${formatNumber(
     risk.swingLow
   )} ~ ${formatNumber(risk.swingHigh)}`;
+}
+
+// ---- Fundamentals (本益比 / EPS / 市值 ...) via the Cloudflare Worker ----
+// Yahoo's quoteSummary endpoint requires a cookie+crumb session a static page
+// cannot obtain on its own (CORS + auth), so this is proxied through the
+// small backend in worker/worker.js. Degrades gracefully to "no data" if
+// WORKER_BASE_URL isn't configured or Yahoo's auth flow changes again.
+
+function formatMarketCap(value) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return "--";
+  const abs = Math.abs(value);
+  if (abs >= 1e12) return `${formatNumber(value / 1e12, 2)}兆`;
+  if (abs >= 1e8) return `${formatNumber(value / 1e8, 1)}億`;
+  if (abs >= 1e4) return `${formatNumber(value / 1e4, 1)}萬`;
+  return formatNumber(value, 0);
+}
+
+function renderFundamentals(payload) {
+  const f = payload.fundamentals;
+  if (f === undefined) {
+    els.fundamentalsContext.textContent = WORKER_BASE_URL ? "載入中…" : "尚未設定後端";
+    return;
+  }
+  if (!f) {
+    els.fundamentalsContext.textContent = "暫無資料";
+    return;
+  }
+  const parts = [];
+  if (f.trailingPE != null) parts.push(`本益比 ${formatNumber(f.trailingPE, 1)}`);
+  if (f.trailingEps != null) parts.push(`EPS ${formatNumber(f.trailingEps, 2)}`);
+  if (f.marketCap != null) parts.push(`市值 ${formatMarketCap(f.marketCap)}`);
+  if (f.dividendYield != null) parts.push(`殖利率 ${formatNumber(f.dividendYield * 100, 2)}%`);
+  els.fundamentalsContext.textContent = parts.length ? parts.join("｜") : "暫無資料";
 }
 
 function renderSummary(payload, latest) {
@@ -414,20 +470,28 @@ async function renderSymbol() {
     }
   }
 
+  const benchmark = benchmarkFor(payload.currency);
+  if (!state.market[benchmark.symbol]) {
+    state.market[benchmark.symbol] = { status: "loading", trend: null, pct: null };
+    ensureMarketTrend(benchmark);
+  }
+
   if (state.currentSymbol !== payload.symbol || state.currentTimeframe !== timeframe) return; // stale response
   if (!rows || !rows.length) return;
 
   const latest = latestRows(rows, 1)[0];
   renderSummary(payload, latest);
-  renderSuggestion(rows);
-  renderMarketContext();
+  renderSuggestion(rows, payload);
+  renderMarketContext(benchmark);
   renderValuationContext(payload);
   renderRiskContext(rows);
+  renderFundamentals(payload);
   renderAlerts(latest);
   renderTable(rows);
   renderChart(rows);
 
   if (!payload.fiftyTwoWeekHigh || !payload.fiftyTwoWeekLow) backfillFiftyTwoWeek(payload);
+  if (payload.fundamentals === undefined) backfillFundamentals(payload);
 }
 
 // Pre-baked default symbols ship without 52-week meta (only computed rows).
@@ -447,6 +511,18 @@ async function backfillFiftyTwoWeek(payload) {
   } finally {
     backfillInFlight.delete(payload.symbol);
   }
+}
+
+let fundamentalsInFlight = new Set();
+async function backfillFundamentals(payload) {
+  if (fundamentalsInFlight.has(payload.symbol) || payload.fundamentals !== undefined) return;
+  fundamentalsInFlight.add(payload.symbol);
+  try {
+    payload.fundamentals = await fetchFundamentals(payload.symbol);
+  } finally {
+    fundamentalsInFlight.delete(payload.symbol);
+  }
+  if (state.currentSymbol === payload.symbol) renderFundamentals(payload);
 }
 
 function hydrateSymbolSelect() {
@@ -562,9 +638,54 @@ async function fetchViaProxies(url) {
   throw lastError || new Error("所有連線方式都失敗");
 }
 
+// If a Cloudflare Worker backend is configured, try it first — it fetches
+// Yahoo server-side (no CORS issues, no public-proxy flakiness), and it's
+// the same Worker that also handles the crumb-authenticated fundamentals
+// call. Falls back to the direct-fetch + public-proxy chain if the Worker
+// isn't configured or fails.
+async function fetchChartJson(symbol, range, interval) {
+  const attempts = [];
+
+  if (WORKER_BASE_URL) {
+    attempts.push(async () => {
+      const res = await fetch(
+        `${WORKER_BASE_URL}/chart?symbol=${encodeURIComponent(symbol)}&range=${range}&interval=${interval}`,
+        { headers: { Accept: "application/json" } }
+      );
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.json();
+    });
+  }
+
+  const directUrl = `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=${range}&interval=${interval}`;
+  attempts.push(() => fetchViaProxies(directUrl));
+
+  let lastError = null;
+  for (const attempt of attempts) {
+    try {
+      return await attempt();
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw lastError || new Error("所有連線方式都失敗");
+}
+
+async function fetchFundamentals(symbol) {
+  if (!WORKER_BASE_URL) return null;
+  try {
+    const res = await fetch(`${WORKER_BASE_URL}/fundamentals?symbol=${encodeURIComponent(symbol)}`);
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data.error) return null;
+    return data;
+  } catch {
+    return null;
+  }
+}
+
 async function fetchChart(symbol, timeframeConfig) {
-  const url = `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=${timeframeConfig.range}&interval=${timeframeConfig.interval}`;
-  const json = await fetchViaProxies(url);
+  const json = await fetchChartJson(symbol, timeframeConfig.range, timeframeConfig.interval);
   const chartError = json && json.chart && json.chart.error;
   if (chartError) throw new Error(chartError.description || "查無此股票代號");
   const result = json && json.chart && json.chart.result && json.chart.result[0];
@@ -573,6 +694,10 @@ async function fetchChart(symbol, timeframeConfig) {
   const meta = result.meta || {};
   const ts = result.timestamp || [];
   const quote = (result.indicators && result.indicators.quote && result.indicators.quote[0]) || {};
+  // Use the exchange's own timezone (Yahoo returns e.g. "America/New_York" or
+  // "Asia/Taipei") so trading-day dates line up correctly for non-US markets
+  // like Taiwan-listed stocks, instead of always formatting in US Eastern time.
+  const tz = meta.exchangeTimezoneName || meta.timezone || "America/New_York";
 
   const rawRows = [];
   for (let i = 0; i < ts.length; i++) {
@@ -583,7 +708,7 @@ async function fetchChart(symbol, timeframeConfig) {
     const v = quote.volume && quote.volume[i];
     if (o == null || h == null || l == null || c == null || v == null) continue;
     const dateStr = new Intl.DateTimeFormat("en-CA", {
-      timeZone: "America/New_York",
+      timeZone: tz,
       year: "numeric",
       month: "2-digit",
       day: "2-digit",
@@ -634,21 +759,24 @@ async function ensureTimeframe(symbol, timeframe) {
   return rows;
 }
 
-async function refreshMarketTrend() {
+async function ensureMarketTrend(benchmark) {
   try {
-    const { rows } = await fetchChart(MARKET_INDEX_SYMBOL, TIMEFRAME_CONFIG.daily);
+    const { rows } = await fetchChart(benchmark.symbol, TIMEFRAME_CONFIG.daily);
     const closes = rows.map((r) => r.close).filter((v) => v != null);
     const sample = closes.slice(-20);
     if (!sample.length) throw new Error("no data");
     const sma20 = sample.reduce((a, b) => a + b, 0) / sample.length;
     const lastClose = closes[closes.length - 1];
     const pct = ((lastClose - sma20) / sma20) * 100;
-    state.market = { status: "ready", trend: lastClose >= sma20 ? "bull" : "bear", pct };
+    state.market[benchmark.symbol] = { status: "ready", trend: lastClose >= sma20 ? "bull" : "bear", pct };
   } catch (err) {
-    state.market = { status: "error", trend: null, pct: null };
+    state.market[benchmark.symbol] = { status: "error", trend: null, pct: null };
   }
-  renderMarketContext();
-  renderSymbol();
+  const payload = getSelectedPayload();
+  if (payload && benchmarkFor(payload.currency).symbol === benchmark.symbol) {
+    renderMarketContext(benchmark);
+    renderSymbol();
+  }
 }
 
 function loadStoredSymbols() {
@@ -670,40 +798,63 @@ function persistStoredSymbol(symbol, payload) {
   }
 }
 
-async function addSymbol(rawSymbol) {
-  const symbol = rawSymbol.trim().toUpperCase();
-  if (!symbol) return;
+// A bare 4~6 digit input (e.g. "2330") is almost certainly a Taiwan ticker
+// typed without its Yahoo suffix, so try the Taiwan Stock Exchange (.TW)
+// first and fall back to the Taipei Exchange / OTC (.TWO). Anything already
+// containing a "." (explicit suffix, e.g. "2330.TW" or "BRK.B") is used as-is.
+function resolveSymbolCandidates(rawSymbol) {
+  const trimmed = rawSymbol.trim().toUpperCase();
+  if (!trimmed) return [];
+  if (trimmed.includes(".")) return [trimmed];
+  if (/^\d{4,6}$/.test(trimmed)) return [`${trimmed}.TW`, `${trimmed}.TWO`];
+  return [trimmed];
+}
 
-  if (state.data.symbols[symbol]) {
-    state.currentSymbol = symbol;
-    if (!state.visibleSymbols.includes(symbol)) state.visibleSymbols.push(symbol);
+async function addSymbol(rawSymbol) {
+  const candidates = resolveSymbolCandidates(rawSymbol);
+  if (!candidates.length) return;
+
+  const existingKey = candidates.find((c) => state.data.symbols[c]);
+  if (existingKey) {
+    state.currentSymbol = existingKey;
+    if (!state.visibleSymbols.includes(existingKey)) state.visibleSymbols.push(existingKey);
     hydrateSymbolSelect();
     renderSymbol();
-    setHint(`${symbol} 已在觀察清單中。`, null);
+    setHint(`${existingKey} 已在觀察清單中。`, null);
     return;
   }
 
   els.addSymbolBtn.disabled = true;
   els.addSymbolBtn.textContent = "查詢中…";
-  setHint(`正在即時抓取 ${symbol} 的日線資料…`, null);
+  setHint(`正在即時抓取 ${candidates.join(" / ")} 的日線資料…`, null);
 
-  try {
-    const payload = await fetchLiveSymbol(symbol);
-    state.data.symbols[symbol] = payload;
-    state.visibleSymbols.push(symbol);
-    state.currentSymbol = symbol;
-    state.currentTimeframe = "daily";
-    els.timeframeSelect.value = "daily";
-    persistStoredSymbol(symbol, payload);
-    hydrateSymbolSelect();
-    renderSymbol();
-    setHint(`${symbol} 已即時加入儀表板（資料來源：Yahoo Finance）。`, "success");
-  } catch (err) {
-    setHint(`找不到 ${symbol}：${err.message || err}。請確認是否為有效的美股代號。`, "error");
-  } finally {
-    els.addSymbolBtn.disabled = false;
-    els.addSymbolBtn.textContent = "加入";
+  let lastError = null;
+  for (const symbol of candidates) {
+    try {
+      const payload = await fetchLiveSymbol(symbol);
+      state.data.symbols[symbol] = payload;
+      state.visibleSymbols.push(symbol);
+      state.currentSymbol = symbol;
+      state.currentTimeframe = "daily";
+      els.timeframeSelect.value = "daily";
+      persistStoredSymbol(symbol, payload);
+      hydrateSymbolSelect();
+      renderSymbol();
+      setHint(`${symbol} 已即時加入儀表板（資料來源：Yahoo Finance）。`, "success");
+      els.addSymbolBtn.disabled = false;
+      els.addSymbolBtn.textContent = "加入";
+      return;
+    } catch (err) {
+      lastError = err;
+    }
   }
+
+  setHint(
+    `找不到 ${candidates.join(" / ")}：${lastError && (lastError.message || lastError)}。請確認代號是否正確（美股如 AAPL；台股可直接輸入數字如 2330，或加上 .TW／.TWO）。`,
+    "error"
+  );
+  els.addSymbolBtn.disabled = false;
+  els.addSymbolBtn.textContent = "加入";
 }
 
 function renderPrivateCompanies() {
@@ -733,7 +884,6 @@ async function init() {
   els.sourceName.textContent = state.data.source || "";
   renderPrivateCompanies();
   renderSymbol();
-  refreshMarketTrend();
 }
 
 els.symbolSelect.addEventListener("change", (event) => {
